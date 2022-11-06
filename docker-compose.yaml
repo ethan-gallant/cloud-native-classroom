@@ -1,0 +1,15 @@
+services:
+  envoy:
+    build: class-portal
+    network_mode: host
+    volumes:
+        - ./class-portal/certs:/etc/certs
+  workspace:
+    build: workspaces/ubuntu-20.04
+    network_mode: host
+    volumes:
+      - workspace-data:/home/user/workspace
+
+volumes:
+  workspace-data:
+    driver: local

@@ -1,0 +1,123 @@
+static_resources:
+  listeners:
+    - address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8443
+      per_connection_buffer_limit_bytes: 32768 # 32 KiB
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                use_remote_address: true
+                normalize_path: true
+                merge_slashes: true
+                path_with_escaped_slashes_action: UNESCAPE_AND_REDIRECT
+                http2_protocol_options:
+                  max_concurrent_streams: 500
+                  initial_stream_window_size: 65536 # 64 KiB
+                  initial_connection_window_size: 1048576 # 1 MiB
+                  allow_connect: true
+                server_header_transformation: PASS_THROUGH
+                common_http_protocol_options:
+                  idle_timeout: 900s
+                stream_idle_timeout: 300s # 5 mins, must be disabled for long-lived and streaming requests
+                request_timeout: 120s # 2 mins, must be disabled for long-lived and streaming requests
+                request_headers_timeout: 15s
+                stream_error_on_invalid_http_message: true
+                upgrade_configs:
+                  - upgrade_type: CONNECT
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local_service
+                      domains: [ "*" ]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: dynamic_forward_proxy_cluster
+                          typed_per_filter_config:
+                            envoy.filters.http.dynamic_forward_proxy:
+                              '@type': type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.PerRouteConfig
+                              host_rewrite_header: X-Host-Port
+                access_log:
+                  - name: envoy.access_loggers.stderr
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StderrAccessLog
+                      log_format:
+                        text_format: '[%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%" %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% "%REQ(X-FORWARDED-FOR)%" "%REQ(USER-AGENT)%" "%REQ(X-REQUEST-ID)%" "%REQ(:AUTHORITY)%" "%UPSTREAM_HOST%" "%DYNAMIC_METADATA(envoy.filters.http.jwt_authn)%"\n'
+                http_filters:
+                  - name: envoy.filters.http.jwt_authn
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+                      providers:
+                        provider:
+                          local_jwks:
+                            filename: /etc/certs/jwks.json
+                          payload_in_metadata: payload
+                          from_cookies:
+                            - auth-token
+                      rules:
+                        - match:
+                            prefix: /
+                          requires:
+                            provider_name: provider
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      inline_code: |
+                        function envoy_on_request(request_handle)
+                            local payload = request_handle:streamInfo():dynamicMetadata():get("envoy.filters.http.jwt_authn")["payload"]
+                            if payload["dest"] == nil or payload["namespace"] == nil then
+                                request_handle:logInfo("Rejecting request due to missing dest or namespace")
+                                request_handle:respond({[":status"] = "401"}, "Missing required auth parameters")
+                            end
+                            local dest = payload["dest"]
+                            local namespace = payload["namespace"]
+                            request_handle:logInfo("dest: " .. dest .. ", namespace: " .. namespace)
+                            request_handle:headers():remove("Host")
+                            request_handle:headers():add("Host", dest)
+                            request_handle:headers():add("X-Host-Port", dest .. ":" .. 8000)
+                        
+                        end
+                  - name: envoy.filters.http.dynamic_forward_proxy
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+                      dns_cache_config:
+                        name: dynamic_forward_proxy_cache_config
+                        dns_lookup_family: V4_ONLY
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: "/etc/certs/cert.pem" }
+                    private_key: { filename: "/etc/certs/cert.key" }
+  clusters:
+    - name: dynamic_forward_proxy_cluster
+      connect_timeout: 1s
+      lb_policy: CLUSTER_PROVIDED
+      cluster_type:
+        name: envoy.clusters.dynamic_forward_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+          dns_cache_config:
+            name: dynamic_forward_proxy_cache_config
+            dns_lookup_family: V4_ONLY
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+              - certificate_chain: { filename: "/etc/certs/cert.pem" }
+                private_key: { filename: "/etc/certs/cert.key" }
+            validation_context:
+              trusted_ca: {filename: /etc/ssl/certs/ca-certificates.crt}
